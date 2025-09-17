@@ -8,6 +8,10 @@
 (define-constant ERR_OUTPUT_ALREADY_TOKENIZED (err u106))
 (define-constant ERR_TOKEN_NOT_FOUND (err u107))
 (define-constant ERR_NOT_TOKEN_OWNER (err u108))
+(define-constant ERR_NOT_FOR_SALE (err u109))
+(define-constant ERR_INSUFFICIENT_PAYMENT (err u110))
+(define-constant ERR_LISTING_EXISTS (err u111))
+(define-constant ERR_INVALID_PRICE (err u112))
 
 (define-data-var next-factory-id uint u1)
 (define-data-var next-output-id uint u1)
@@ -75,6 +79,32 @@
         total-earned: uint,
     }
 )
+
+(define-map token-listings
+    uint
+    {
+        seller: principal,
+        price: uint,
+        listed-at: uint,
+        active: bool,
+    }
+)
+
+(define-map marketplace-stats
+    (string-ascii 20)
+    uint
+)
+
+(define-map token-bids
+    uint
+    {
+        bidder: principal,
+        amount: uint,
+        expires-at: uint,
+    }
+)
+
+(define-data-var platform-fee-rate uint u250)
 
 (define-read-only (get-contract-info)
     {
@@ -478,5 +508,219 @@
         total-factories: (- (var-get next-factory-id) u1),
         total-outputs: (- (var-get next-output-id) u1),
         total-tokens: (- (var-get next-token-id) u1),
+        total-sales: (default-to u0 (map-get? marketplace-stats "total-sales")),
+        total-volume: (default-to u0 (map-get? marketplace-stats "total-volume")),
+        active-listings: (default-to u0 (map-get? marketplace-stats "active-listings")),
     })
+)
+
+(define-read-only (get-token-listing (token-id uint))
+    (map-get? token-listings token-id)
+)
+
+(define-read-only (get-token-bid (token-id uint))
+    (map-get? token-bids token-id)
+)
+
+(define-read-only (get-platform-fee-rate)
+    (var-get platform-fee-rate)
+)
+
+(define-private (update-marketplace-stats
+        (stat-key (string-ascii 20))
+        (amount uint)
+    )
+    (let ((current-value (default-to u0 (map-get? marketplace-stats stat-key))))
+        (map-set marketplace-stats stat-key (+ current-value amount))
+    )
+)
+
+(define-private (calculate-platform-fee (sale-price uint))
+    (/ (* sale-price (var-get platform-fee-rate)) u10000)
+)
+
+(define-public (list-token-for-sale
+        (token-id uint)
+        (price uint)
+    )
+    (let ((token (unwrap! (map-get? output-tokens token-id) ERR_TOKEN_NOT_FOUND)))
+        (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+        (asserts! (is-eq tx-sender (get owner token)) ERR_NOT_TOKEN_OWNER)
+        (asserts! (> price u0) ERR_INVALID_PRICE)
+        (asserts! (is-none (map-get? token-listings token-id)) ERR_LISTING_EXISTS)
+
+        (map-set token-listings token-id {
+            seller: tx-sender,
+            price: price,
+            listed-at: stacks-block-height,
+            active: true,
+        })
+
+        (update-marketplace-stats "active-listings" u1)
+        (ok true)
+    )
+)
+
+(define-public (cancel-token-listing (token-id uint))
+    (let ((listing (unwrap! (map-get? token-listings token-id) ERR_NOT_FOR_SALE)))
+        (asserts! (is-eq tx-sender (get seller listing)) ERR_UNAUTHORIZED)
+        (asserts! (get active listing) ERR_NOT_FOR_SALE)
+
+        (map-set token-listings token-id (merge listing { active: false }))
+
+        (let ((current-listings (default-to u0 (map-get? marketplace-stats "active-listings"))))
+            (map-set marketplace-stats "active-listings"
+                (if (> current-listings u0)
+                    (- current-listings u1)
+                    u0
+                ))
+        )
+        (ok true)
+    )
+)
+
+(define-public (buy-token (token-id uint))
+    (let (
+            (listing (unwrap! (map-get? token-listings token-id) ERR_NOT_FOR_SALE))
+            (token (unwrap! (map-get? output-tokens token-id) ERR_TOKEN_NOT_FOUND))
+            (sale-price (get price listing))
+            (platform-fee (calculate-platform-fee sale-price))
+            (seller-amount (- sale-price platform-fee))
+        )
+        (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+        (asserts! (get active listing) ERR_NOT_FOR_SALE)
+        (asserts! (not (is-eq tx-sender (get seller listing))) ERR_INVALID_PARAMS)
+
+        (try! (stx-transfer? seller-amount tx-sender (get seller listing)))
+        (and
+            (> platform-fee u0)
+            (try! (stx-transfer? platform-fee tx-sender CONTRACT_OWNER))
+        )
+
+        (map-set output-tokens token-id
+            (merge token {
+                owner: tx-sender,
+                last-transfer: stacks-block-height,
+            })
+        )
+
+        (map-set token-listings token-id (merge listing { active: false }))
+
+        (remove-token-from-owner (get seller listing) token-id)
+        (add-token-to-owner tx-sender token-id)
+
+        (update-user-stats (get seller listing) "total-earned" seller-amount)
+        (update-user-stats tx-sender "total-spent" sale-price)
+        (update-marketplace-stats "total-sales" u1)
+        (update-marketplace-stats "total-volume" sale-price)
+
+        (let ((current-listings (default-to u0 (map-get? marketplace-stats "active-listings"))))
+            (map-set marketplace-stats "active-listings"
+                (if (> current-listings u0)
+                    (- current-listings u1)
+                    u0
+                ))
+        )
+        (ok true)
+    )
+)
+
+(define-public (place-bid
+        (token-id uint)
+        (bid-amount uint)
+        (expires-in-blocks uint)
+    )
+    (let ((token (unwrap! (map-get? output-tokens token-id) ERR_TOKEN_NOT_FOUND)))
+        (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+        (asserts! (> bid-amount u0) ERR_INVALID_PRICE)
+        (asserts! (> expires-in-blocks u0) ERR_INVALID_PARAMS)
+        (asserts! (not (is-eq tx-sender (get owner token))) ERR_INVALID_PARAMS)
+
+        (let ((current-bid (map-get? token-bids token-id)))
+            (match current-bid
+                existing-bid (asserts! (> bid-amount (get amount existing-bid))
+                    ERR_INSUFFICIENT_PAYMENT
+                )
+                true
+            )
+        )
+
+        (try! (stx-transfer? bid-amount tx-sender (as-contract tx-sender)))
+
+        (map-set token-bids token-id {
+            bidder: tx-sender,
+            amount: bid-amount,
+            expires-at: (+ stacks-block-height expires-in-blocks),
+        })
+
+        (ok true)
+    )
+)
+
+(define-public (accept-bid (token-id uint))
+    (let (
+            (token (unwrap! (map-get? output-tokens token-id) ERR_TOKEN_NOT_FOUND))
+            (bid (unwrap! (map-get? token-bids token-id) ERR_NOT_FOUND))
+            (bid-amount (get amount bid))
+            (platform-fee (calculate-platform-fee bid-amount))
+            (seller-amount (- bid-amount platform-fee))
+        )
+        (asserts! (is-eq tx-sender (get owner token)) ERR_NOT_TOKEN_OWNER)
+        (asserts! (< stacks-block-height (get expires-at bid)) ERR_INVALID_PARAMS)
+
+        (try! (as-contract (stx-transfer? seller-amount tx-sender (get owner token))))
+        (and
+            (> platform-fee u0)
+            (try! (as-contract (stx-transfer? platform-fee tx-sender CONTRACT_OWNER)))
+        )
+
+        (map-set output-tokens token-id
+            (merge token {
+                owner: (get bidder bid),
+                last-transfer: stacks-block-height,
+            })
+        )
+
+        (let ((listing (map-get? token-listings token-id)))
+            (match listing
+                existing-listing (map-set token-listings token-id
+                    (merge existing-listing { active: false })
+                )
+                true
+            )
+        )
+
+        (map-delete token-bids token-id)
+        (remove-token-from-owner tx-sender token-id)
+        (add-token-to-owner (get bidder bid) token-id)
+
+        (update-user-stats tx-sender "total-earned" seller-amount)
+        (update-user-stats (get bidder bid) "total-spent" bid-amount)
+        (update-marketplace-stats "total-sales" u1)
+        (update-marketplace-stats "total-volume" bid-amount)
+
+        (ok true)
+    )
+)
+
+(define-public (withdraw-bid (token-id uint))
+    (let ((bid (unwrap! (map-get? token-bids token-id) ERR_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get bidder bid)) ERR_UNAUTHORIZED)
+        (asserts! (>= stacks-block-height (get expires-at bid))
+            ERR_INVALID_PARAMS
+        )
+
+        (try! (as-contract (stx-transfer? (get amount bid) tx-sender (get bidder bid))))
+        (map-delete token-bids token-id)
+        (ok true)
+    )
+)
+
+(define-public (set-platform-fee-rate (new-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (<= new-rate u1000) ERR_INVALID_PARAMS)
+        (var-set platform-fee-rate new-rate)
+        (ok true)
+    )
 )
