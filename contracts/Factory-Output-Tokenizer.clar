@@ -724,3 +724,28 @@
         (ok true)
     )
 )
+
+(define-private (sum-funding (item {id: uint, amount: uint}) (acc uint))
+    (+ acc (get amount item))
+)
+
+(define-private (apply-funding (item {id: uint, amount: uint}) (ok-so-far bool))
+    (let ((fid (get id item)) (amt (get amount item)))
+        (asserts! (> amt u0) ok-so-far)
+        (asserts! (is-some (map-get? factories fid)) ok-so-far)
+        (let ((current-balance (get-factory-balance fid)))
+            (map-set factory-balances fid (+ current-balance amt))
+        )
+        ok-so-far
+    )
+)
+
+(define-public (bulk-fund-factories (funds (list 50 {id: uint, amount: uint})))
+    (let ((total (fold sum-funding funds u0)))
+        (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+        (asserts! (> total u0) ERR_INVALID_PARAMS)
+        (try! (stx-transfer? total tx-sender (as-contract tx-sender)))
+        (fold apply-funding funds true)
+        (ok true)
+    )
+)
