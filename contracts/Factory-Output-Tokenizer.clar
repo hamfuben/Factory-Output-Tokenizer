@@ -431,6 +431,30 @@
     )
 )
 
+(define-read-only (get-factory-summary (factory-id uint))
+    (let (
+            (factory (unwrap! (map-get? factories factory-id) ERR_NOT_FOUND))
+            (balance (get-factory-balance factory-id))
+            (owner (get owner factory))
+            (owner-stats (get-user-stats owner))
+        )
+        (ok {
+            id: factory-id,
+            name: (get name factory),
+            owner: owner,
+            production-rate: (get production-rate factory),
+            cost-per-output: (get cost-per-output factory),
+            active: (get active factory),
+            created-at: (get created-at factory),
+            total-outputs: (get total-outputs factory),
+            balance: balance,
+            owner-factories-created: (get factories-created owner-stats),
+            owner-outputs-produced: (get outputs-produced owner-stats),
+            owner-tokens-minted: (get tokens-minted owner-stats),
+        })
+    )
+)
+
 (define-public (upgrade-factory
         (factory-id uint)
         (upgrade-cost uint)
